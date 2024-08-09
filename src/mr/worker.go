@@ -1,83 +1,154 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
+import (
+	"fmt"
+	"net/rpc"
+	"os"
+	"time"
 
+	"github.com/sirupsen/logrus"
+)
 
-//
-// Map functions return a slice of KeyValue.
-//
+// KeyValue represents a key-value pair.
 type KeyValue struct {
 	Key   string
 	Value string
 }
 
-//
-// use ihash(key) % NReduce to choose the reduce
-// task number for each KeyValue emitted by Map.
-//
-func ihash(key string) int {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return int(h.Sum32() & 0x7fffffff)
-}
+// Worker is the entry point for a MapReduce worker.
+func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+	workerID := fmt.Sprintf("%d", os.Getpid()) // Use worker's PID as a unique identifier
 
+	for {
+		args := TaskArgs{WorkerID: workerID}
+		reply := TaskReply{}
 
-//
-// main/mrworker.go calls this function.
-//
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
+		ok := call("Coordinator.AssignTask", &args, &reply)
+		if !ok {
+			fmt.Println("Failed to get task from Coordinator")
+			time.Sleep(time.Second)
+			continue
+		}
 
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
-
-}
-
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+		switch reply.TaskType {
+		case "map":
+			if err := doMapTask(reply.Filename, reply.TaskId, reply.NReduce, mapf); err != nil {
+				logrus.WithFields(logrus.Fields{
+					"taskType": "map",
+					"taskId":   reply.TaskId,
+				}).Errorf("Failed to complete task: %v", err)
+				continue
+			}
+			taskDone(reply.TaskType, reply.TaskId, workerID)
+		case "reduce":
+			if err := doReduceTask(reply.TaskId, reply.NMap, reducef); err != nil {
+				logrus.WithFields(logrus.Fields{
+					"taskType": "reduce",
+					"taskId":   reply.TaskId,
+				}).Errorf("Failed to complete task: %v", err)
+				continue
+			}
+			taskDone(reply.TaskType, reply.TaskId, workerID)
+		case "wait":
+			time.Sleep(time.Second)
+		}
 	}
 }
 
-//
-// send an RPC request to the coordinator, wait for the response.
-// usually returns true.
-// returns false if something goes wrong.
-//
-func call(rpcname string, args interface{}, reply interface{}) bool {
-	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
-	sockname := coordinatorSock()
-	c, err := rpc.DialHTTP("unix", sockname)
+// doMapTask performs the Map task.
+func doMapTask(filename string, taskId int, nReduce int, mapf func(string, string) []KeyValue) error {
+	content, err := os.ReadFile(filename)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		return fmt.Errorf("cannot open %v: %w", filename, err)
+	}
+	kva := mapf(filename, string(content))
+
+	buckets := make([][]KeyValue, nReduce)
+	for _, kv := range kva {
+		bucket := ihash(kv.Key) % nReduce
+		buckets[bucket] = append(buckets[bucket], kv)
+	}
+
+	for i := 0; i < nReduce; i++ {
+		oname := fmt.Sprintf("mr-%d-%d", taskId, i)
+		file, err := os.Create(oname)
+		if err != nil {
+			return fmt.Errorf("cannot create %v: %w", oname, err)
+		}
+		defer file.Close()
+		if err := writeToJsonFile(file, buckets[i]); err != nil {
+			return fmt.Errorf("cannot write to file %v: %w", oname, err)
+		}
+		logrus.WithFields(logrus.Fields{
+			"taskId": taskId,
+			"file":   oname,
+		}).Info("Map task completed and file created")
+	}
+	return nil
+}
+
+// doReduceTask performs the Reduce task.
+func doReduceTask(taskId int, nMap int, reducef func(string, []string) string) error {
+	intermediate := []KeyValue{}
+	for i := 0; i < nMap; i++ {
+		filename := fmt.Sprintf("mr-%d-%d", i, taskId)
+		file, err := os.Open(filename)
+		if err != nil {
+			return fmt.Errorf("cannot open %v: %w", filename, err)
+		}
+		defer file.Close()
+		intermediate = append(intermediate, readFromJsonFile(file)...)
+	}
+
+	merged := make(map[string][]string)
+	for _, kv := range intermediate {
+		merged[kv.Key] = append(merged[kv.Key], kv.Value)
+	}
+
+	oname := fmt.Sprintf("mr-out-%d", taskId)
+	ofile, err := os.Create(oname)
+	if err != nil {
+		return fmt.Errorf("cannot create %v: %w", oname, err)
+	}
+	defer ofile.Close()
+
+	for key, values := range merged {
+		output := reducef(key, values)
+		fmt.Fprintf(ofile, "%v %v\n", key, output)
+	}
+	logrus.WithFields(logrus.Fields{
+		"taskId": taskId,
+		"file":   oname,
+	}).Info("Reduce task completed and file created")
+	return nil
+}
+
+// taskDone reports task completion to the Coordinator.
+func taskDone(taskType string, taskId int, workerID string) {
+	args := TaskDoneArgs{TaskType: taskType, TaskId: taskId, WorkerID: workerID}
+	reply := TaskDoneReply{}
+	call("Coordinator.TaskDone", &args, &reply)
+}
+
+// call sends an RPC request to the Coordinator and waits for the response.
+func call(rpcname string, args interface{}, reply interface{}) bool {
+	sockname := coordinatorSock()
+	var c *rpc.Client
+	var err error
+
+	for i := 0; i < 5; i++ {
+		c, err = rpc.DialHTTP("unix", sockname)
+		if err == nil {
+			break
+		}
+		logrus.WithFields(logrus.Fields{
+			"attempt": i + 1,
+		}).Warnf("Dialing failed: %v", err)
+		time.Sleep(2 * time.Second)
+	}
+
+	if err != nil {
+		logrus.Fatalf("Dialing failed: %v", err)
 	}
 	defer c.Close()
 
@@ -86,6 +157,8 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 		return true
 	}
 
-	fmt.Println(err)
+	logrus.WithFields(logrus.Fields{
+		"rpcname": rpcname,
+	}).Errorf("RPC call error: %v", err)
 	return false
 }
