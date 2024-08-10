@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"context"
 	"fmt"
 	"net/rpc"
 	"os"
@@ -23,31 +24,33 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 		args := TaskArgs{WorkerID: workerID}
 		reply := TaskReply{}
 
-		ok := call("Coordinator.AssignTask", &args, &reply)
+		ok := callWithRetry("Coordinator.AssignTask", &args, &reply)
 		if !ok {
-			fmt.Println("Failed to get task from Coordinator")
+			logrus.Warn("Failed to get task from Coordinator")
 			time.Sleep(time.Second)
 			continue
 		}
 
 		switch reply.TaskType {
 		case "map":
-			if err := doMapTask(reply.Filename, reply.TaskId, reply.NReduce, mapf); err != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := doMapTask(ctx, reply.Filename, reply.TaskId, reply.NReduce, mapf); err != nil {
 				logrus.WithFields(logrus.Fields{
 					"taskType": "map",
 					"taskId":   reply.TaskId,
 				}).Errorf("Failed to complete task: %v", err)
-				continue
 			}
+			cancel() 
 			taskDone(reply.TaskType, reply.TaskId, workerID)
 		case "reduce":
-			if err := doReduceTask(reply.TaskId, reply.NMap, reducef); err != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if err := doReduceTask(ctx, reply.TaskId, reply.NMap, reducef); err != nil {
 				logrus.WithFields(logrus.Fields{
 					"taskType": "reduce",
 					"taskId":   reply.TaskId,
 				}).Errorf("Failed to complete task: %v", err)
-				continue
 			}
+			cancel()
 			taskDone(reply.TaskType, reply.TaskId, workerID)
 		case "wait":
 			time.Sleep(time.Second)
@@ -55,8 +58,9 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 	}
 }
 
+
 // doMapTask performs the Map task.
-func doMapTask(filename string, taskId int, nReduce int, mapf func(string, string) []KeyValue) error {
+func doMapTask(ctx context.Context, filename string, taskId int, nReduce int, mapf func(string, string) []KeyValue) error {
 	content, err := os.ReadFile(filename)
 	if err != nil {
 		return fmt.Errorf("cannot open %v: %w", filename, err)
@@ -70,34 +74,44 @@ func doMapTask(filename string, taskId int, nReduce int, mapf func(string, strin
 	}
 
 	for i := 0; i < nReduce; i++ {
-		oname := fmt.Sprintf("mr-%d-%d", taskId, i)
-		file, err := os.Create(oname)
-		if err != nil {
-			return fmt.Errorf("cannot create %v: %w", oname, err)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("task %d canceled: %w", taskId, ctx.Err())
+		default:
+			oname := fmt.Sprintf("mr-%d-%d", taskId, i)
+			file, err := os.Create(oname)
+			if err != nil {
+				return fmt.Errorf("cannot create %v: %w", oname, err)
+			}
+			defer file.Close()
+			if err := writeToJsonFile(file, buckets[i]); err != nil {
+				return fmt.Errorf("cannot write to file %v: %w", oname, err)
+			}
+			logrus.WithFields(logrus.Fields{
+				"taskId": taskId,
+				"file":   oname,
+			}).Info("Map task completed and file created")
 		}
-		defer file.Close()
-		if err := writeToJsonFile(file, buckets[i]); err != nil {
-			return fmt.Errorf("cannot write to file %v: %w", oname, err)
-		}
-		logrus.WithFields(logrus.Fields{
-			"taskId": taskId,
-			"file":   oname,
-		}).Info("Map task completed and file created")
 	}
 	return nil
 }
 
 // doReduceTask performs the Reduce task.
-func doReduceTask(taskId int, nMap int, reducef func(string, []string) string) error {
+func doReduceTask(ctx context.Context, taskId int, nMap int, reducef func(string, []string) string) error {
 	intermediate := []KeyValue{}
 	for i := 0; i < nMap; i++ {
-		filename := fmt.Sprintf("mr-%d-%d", i, taskId)
-		file, err := os.Open(filename)
-		if err != nil {
-			return fmt.Errorf("cannot open %v: %w", filename, err)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("task %d canceled: %w", taskId, ctx.Err())
+		default:
+			filename := fmt.Sprintf("mr-%d-%d", i, taskId)
+			file, err := os.Open(filename)
+			if err != nil {
+				return fmt.Errorf("cannot open %v: %w", filename, err)
+			}
+			defer file.Close()
+			intermediate = append(intermediate, readFromJsonFile(file)...)
 		}
-		defer file.Close()
-		intermediate = append(intermediate, readFromJsonFile(file)...)
 	}
 
 	merged := make(map[string][]string)
@@ -113,8 +127,13 @@ func doReduceTask(taskId int, nMap int, reducef func(string, []string) string) e
 	defer ofile.Close()
 
 	for key, values := range merged {
-		output := reducef(key, values)
-		fmt.Fprintf(ofile, "%v %v\n", key, output)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("task %d canceled: %w", taskId, ctx.Err())
+		default:
+			output := reducef(key, values)
+			fmt.Fprintf(ofile, "%v %v\n", key, output)
+		}
 	}
 	logrus.WithFields(logrus.Fields{
 		"taskId": taskId,
@@ -127,10 +146,10 @@ func doReduceTask(taskId int, nMap int, reducef func(string, []string) string) e
 func taskDone(taskType string, taskId int, workerID string) {
 	args := TaskDoneArgs{TaskType: taskType, TaskId: taskId, WorkerID: workerID}
 	reply := TaskDoneReply{}
-	call("Coordinator.TaskDone", &args, &reply)
+	callWithRetry("Coordinator.TaskDone", &args, &reply)
 }
 
-// call sends an RPC request to the Coordinator and waits for the response.
+// call sends an RPC request to the Coordinator and waits for the response
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	sockname := coordinatorSock()
 	var c *rpc.Client

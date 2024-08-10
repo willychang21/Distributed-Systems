@@ -6,23 +6,41 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"os/signal"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/sirupsen/logrus"
 )
 
+// TaskStatus represents the status of a task
+type TaskStatus int
+
+const (
+	Idle TaskStatus = iota
+	InProgress
+	Completed
+)
+
+type WorkerPerformance struct {
+	avgCompletionTime time.Duration
+	taskCount         int
+}
+
 // Coordinator manages the overall MapReduce process
 type Coordinator struct {
-	mu             sync.Mutex
-	mapTasks       []string
-	nReduce        int
-	taskStatus     map[int]string
-	workerLoads    map[string]int 
-	done           bool
-	mapTaskDone    int
-	reduceTaskDone int
+	mu                sync.Mutex
+	mapTasks          []string
+	nReduce           int
+	taskStatus        map[int]TaskStatus
+	workerLoads       map[string]int
+	workerPerformance map[string]WorkerPerformance
+	done              bool
+	mapTaskDone       int
+	reduceTaskDone    int
+	shutdown          chan os.Signal
 }
 
 // AssignTask handles task assignment to workers based on load and availability
@@ -35,8 +53,8 @@ func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
 
 	// Assign Map Task
 	for i, file := range c.mapTasks {
-		if c.taskStatus[i] == "idle" {
-			c.taskStatus[i] = "in-progress"
+		if c.taskStatus[i] == Idle {
+			c.taskStatus[i] = InProgress
 			reply.TaskType = "map"
 			reply.Filename = file
 			reply.TaskId = i
@@ -54,8 +72,8 @@ func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
 	// Assign Reduce Task
 	if c.mapTaskDone == len(c.mapTasks) {
 		for i := 0; i < c.nReduce; i++ {
-			if c.taskStatus[i+len(c.mapTasks)] == "idle" {
-				c.taskStatus[i+len(c.mapTasks)] = "in-progress"
+			if c.taskStatus[i+len(c.mapTasks)] == Idle {
+				c.taskStatus[i+len(c.mapTasks)] = InProgress
 				reply.TaskType = "reduce"
 				reply.TaskId = i
 				reply.NReduce = c.nReduce
@@ -86,10 +104,10 @@ func (c *Coordinator) TaskDone(args *TaskDoneArgs, reply *TaskDoneReply) error {
 
 	if args.TaskType == "map" {
 		c.mapTaskDone++
-		c.taskStatus[args.TaskId] = "completed"
+		c.taskStatus[args.TaskId] = Completed
 	} else if args.TaskType == "reduce" {
 		c.reduceTaskDone++
-		c.taskStatus[args.TaskId+len(c.mapTasks)] = "completed"
+		c.taskStatus[args.TaskId+len(c.mapTasks)] = Completed
 	}
 
 	if c.mapTaskDone == len(c.mapTasks) && c.reduceTaskDone == c.nReduce {
@@ -115,20 +133,25 @@ func (c *Coordinator) Done() bool {
 // MakeCoordinator initializes a Coordinator and starts the RPC server
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
-		mapTasks:    files,
-		nReduce:     nReduce,
-		taskStatus:  make(map[int]string),
-		workerLoads: make(map[string]int),
+		mapTasks:          files,
+		nReduce:           nReduce,
+		taskStatus:        make(map[int]TaskStatus),
+		workerLoads:       make(map[string]int),
+		workerPerformance: make(map[string]WorkerPerformance),
+		shutdown:          make(chan os.Signal, 1),
 	}
 
 	for i := 0; i < len(files); i++ {
-		c.taskStatus[i] = "idle"
+		c.taskStatus[i] = Idle
 	}
 	for i := 0; i < nReduce; i++ {
-		c.taskStatus[i+len(files)] = "idle"
+		c.taskStatus[i+len(files)] = Idle
 	}
 
+	signal.Notify(c.shutdown, syscall.SIGINT, syscall.SIGTERM)
 	go c.server()
+	go c.handleShutdown()
+
 	return &c
 }
 
@@ -139,21 +162,30 @@ func (c *Coordinator) monitorWorker(taskId int, taskType string, workerID string
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
+	startTime := time.Now()
 	<-ctx.Done()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if taskType == "map" && c.taskStatus[taskId] == "in-progress" {
-		c.taskStatus[taskId] = "idle"
+	// Reassign task if it's still in progress
+	if taskType == "map" && c.taskStatus[taskId] == InProgress {
+		c.taskStatus[taskId] = Idle
 		logrus.WithFields(logrus.Fields{
 			"task": taskId,
 		}).Warn("Map Task reassigned after timeout")
-	} else if taskType == "reduce" && c.taskStatus[taskId+len(c.mapTasks)] == "in-progress" {
-		c.taskStatus[taskId+len(c.mapTasks)] = "idle"
+	} else if taskType == "reduce" && c.taskStatus[taskId+len(c.mapTasks)] == InProgress {
+		c.taskStatus[taskId+len(c.mapTasks)] = Idle
 		logrus.WithFields(logrus.Fields{
 			"task": taskId,
 		}).Warn("Reduce Task reassigned after timeout")
 	}
+
+	// Record worker performance
+	elapsedTime := time.Since(startTime)
+	performance := c.workerPerformance[workerID]
+	performance.avgCompletionTime = (performance.avgCompletionTime*time.Duration(performance.taskCount) + elapsedTime) / time.Duration(performance.taskCount+1)
+	performance.taskCount++
+	c.workerPerformance[workerID] = performance
 
 	// Cancel task if reassigned
 	c.cancelTask(workerID, taskId, taskType)
@@ -162,7 +194,6 @@ func (c *Coordinator) monitorWorker(taskId int, taskType string, workerID string
 // cancelTask sends a cancellation signal to the worker if the task is reassigned
 func (c *Coordinator) cancelTask(workerID string, taskId int, taskType string) {
 	// Implement task cancellation logic here
-	// For example, send a cancellation RPC to the worker or remove the task from its queue
 	logrus.WithFields(logrus.Fields{
 		"workerID": workerID,
 		"taskType": taskType,
@@ -186,4 +217,42 @@ func (c *Coordinator) server() {
 // coordinatorSock generates a unique UNIX-domain socket name
 func coordinatorSock() string {
 	return "/var/tmp/5840-mr-" + strconv.Itoa(os.Getuid())
+}
+
+// handleShutdown gracefully handles shutdown signals
+func (c *Coordinator) handleShutdown() {
+	<-c.shutdown
+	logrus.Info("Received shutdown signal, terminating...")
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Gracefully finish ongoing tasks before shutting down
+	for c.mapTaskDone != len(c.mapTasks) || c.reduceTaskDone != c.nReduce {
+		logrus.Info("Waiting for ongoing tasks to complete before shutdown...")
+		time.Sleep(1 * time.Second)
+	}
+	c.done = true
+	logrus.Info("All tasks completed. Coordinator is shutting down.")
+	os.Exit(0)
+}
+
+// callWithRetry sends an RPC request with retries and exponential backoff
+func callWithRetry(rpcname string, args interface{}, reply interface{}) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	backoff := time.Second
+	for {
+		select {
+		case <-ctx.Done():
+			logrus.Errorf("Failed to call RPC %s within timeout", rpcname)
+			return false
+		default:
+			if call(rpcname, args, reply) {
+				return true
+			}
+			time.Sleep(backoff)
+			backoff *= 2
+		}
+	}
 }
