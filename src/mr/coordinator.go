@@ -45,53 +45,76 @@ type Coordinator struct {
 
 // AssignTask handles task assignment to workers based on load and availability
 func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+    c.mu.Lock()
+    defer c.mu.Unlock()
 
-	workerID := args.WorkerID
-	c.workerLoads[workerID]++
+    workerID := args.WorkerID
+    c.workerLoads[workerID]++
 
-	// Assign Map Task
-	for i, file := range c.mapTasks {
-		if c.taskStatus[i] == Idle {
-			c.taskStatus[i] = InProgress
-			reply.TaskType = "map"
-			reply.Filename = file
-			reply.TaskId = i
-			reply.NReduce = c.nReduce
-			reply.NMap = len(c.mapTasks)
-			logrus.WithFields(logrus.Fields{
-				"task":     i,
-				"workerID": workerID,
-			}).Info("Assigned Map Task to worker")
-			go c.monitorWorker(i, "map", workerID)
-			return nil
-		}
-	}
+    // Evaluate worker performance for smarter task assignment
+    minLoad := c.workerLoads[workerID]
+    bestWorkerID := workerID
 
-	// Assign Reduce Task
-	if c.mapTaskDone == len(c.mapTasks) {
-		for i := 0; i < c.nReduce; i++ {
-			if c.taskStatus[i+len(c.mapTasks)] == Idle {
-				c.taskStatus[i+len(c.mapTasks)] = InProgress
-				reply.TaskType = "reduce"
-				reply.TaskId = i
-				reply.NReduce = c.nReduce
-				reply.NMap = len(c.mapTasks)
-				logrus.WithFields(logrus.Fields{
-					"task":     i,
-					"workerID": workerID,
-				}).Info("Assigned Reduce Task to worker")
-				go c.monitorWorker(i, "reduce", workerID)
-				return nil
-			}
-		}
-	}
+    for id, load := range c.workerLoads {
+        if load < minLoad {
+            // Consider worker performance in the decision
+            if performance, ok := c.workerPerformance[id]; ok {
+                if performance.avgCompletionTime < c.workerPerformance[bestWorkerID].avgCompletionTime {
+                    bestWorkerID = id
+                    minLoad = load
+                }
+            } else {
+                // If no performance data is available, still consider load
+                bestWorkerID = id
+                minLoad = load
+            }
+        }
+    }
 
-	// If no tasks available, notify worker to wait
-	reply.TaskType = "wait"
-	logrus.Info("No tasks available, worker should wait")
-	return nil
+    workerID = bestWorkerID
+    c.workerLoads[workerID]++
+
+    // Assign Map Task
+    for i, file := range c.mapTasks {
+        if c.taskStatus[i] == Idle {
+            c.taskStatus[i] = InProgress
+            reply.TaskType = "map"
+            reply.Filename = file
+            reply.TaskId = i
+            reply.NReduce = c.nReduce
+            reply.NMap = len(c.mapTasks)
+            logrus.WithFields(logrus.Fields{
+                "task":     i,
+                "workerID": workerID,
+            }).Info("Assigned Map Task to worker")
+            go c.monitorWorker(i, "map", workerID)
+            return nil
+        }
+    }
+
+    // Assign Reduce Task
+    if c.mapTaskDone == len(c.mapTasks) {
+        for i := 0; i < c.nReduce; i++ {
+            if c.taskStatus[i+len(c.mapTasks)] == Idle {
+                c.taskStatus[i+len(c.mapTasks)] = InProgress
+                reply.TaskType = "reduce"
+                reply.TaskId = i
+                reply.NReduce = c.nReduce
+                reply.NMap = len(c.mapTasks)
+                logrus.WithFields(logrus.Fields{
+                    "task":     i,
+                    "workerID": workerID,
+                }).Info("Assigned Reduce Task to worker")
+                go c.monitorWorker(i, "reduce", workerID)
+                return nil
+            }
+        }
+    }
+
+    // If no tasks available, notify worker to wait
+    reply.TaskType = "wait"
+    logrus.Info("No tasks available, worker should wait")
+    return nil
 }
 
 // TaskDone marks a task as completed by a worker
